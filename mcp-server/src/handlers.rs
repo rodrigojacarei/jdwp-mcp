@@ -755,42 +755,162 @@ async fn evaluate_expression(
             
             pos += close_bracket + 1;
         } else if ch == '.' {
-            // Field access
+            // Field access or method call
             pos += 1;
-            let field_end = expr[pos..].find(|c| c == '[' || c == '.').unwrap_or(expr.len() - pos);
-            let field_name = &expr[pos..pos + field_end];
+            let field_end = expr[pos..].find(|c| c == '[' || c == '.' || c == '(').unwrap_or(expr.len() - pos);
+            let name = &expr[pos..pos + field_end];
             
-            // Get field value
-            if let jdwp_client::types::ValueData::Object(object_id) = current_value.data {
-                if object_id == 0 {
-                    return Err("Object is null".to_string());
+            // Check if it's a method call (followed by parentheses)
+            let is_method_call = pos + field_end < expr.len() && expr.chars().nth(pos + field_end) == Some('(');
+            
+            if is_method_call {
+                // Method invocation
+                if let jdwp_client::types::ValueData::Object(object_id) = current_value.data {
+                    if object_id == 0 {
+                        return Err("Object is null".to_string());
+                    }
+                    
+                    // Find closing parenthesis
+                    let close_paren = expr[pos + field_end..].find(')')
+                        .ok_or_else(|| "Missing closing parenthesis".to_string())?;
+                    let args_str = &expr[pos + field_end + 1..pos + field_end + close_paren];
+                    
+                    // Parse arguments (for now, only support simple cases)
+                    let args = parse_method_args(args_str)?;
+                    
+                    // Invoke method
+                    let class_id = connection.get_object_reference_type(object_id).await
+                        .map_err(|e| format!("Failed to get object type: {}", e))?;
+                    
+                    let methods = connection.get_methods(class_id).await
+                        .map_err(|e| format!("Failed to get methods: {}", e))?;
+                    
+                    // Find method by name and argument count
+                    let method = methods.iter().find(|m| m.name == name && count_method_params(&m.signature) == args.len())
+                        .ok_or_else(|| format!("Method '{}' not found", name))?;
+                    
+                    current_value = connection.invoke_method(object_id, thread_id, class_id, method.method_id, args).await
+                        .map_err(|e| format!("Failed to invoke method: {}", e))?;
+                    
+                    pos += field_end + close_paren + 2; // Skip past )
+                } else {
+                    return Err("Not an object".to_string());
+                }
+            } else {
+                // Field access
+                if let jdwp_client::types::ValueData::Object(object_id) = current_value.data {
+                    if object_id == 0 {
+                        return Err("Object is null".to_string());
+                    }
+                    
+                    let class_id = connection.get_object_reference_type(object_id).await
+                        .map_err(|e| format!("Failed to get object type: {}", e))?;
+                    
+                    let fields = connection.get_fields(class_id).await
+                        .map_err(|e| format!("Failed to get fields: {}", e))?;
+                    
+                    let field = fields.iter().find(|f| f.name == name)
+                        .ok_or_else(|| format!("Field '{}' not found", name))?;
+                    
+                    let values = connection.get_object_values(object_id, vec![field.field_id]).await
+                        .map_err(|e| format!("Failed to get field value: {}", e))?;
+                    
+                    current_value = values.into_iter().next()
+                        .ok_or_else(|| "Failed to retrieve field value".to_string())?;
+                } else {
+                    return Err("Not an object".to_string());
                 }
                 
-                let class_id = connection.get_object_reference_type(object_id).await
-                    .map_err(|e| format!("Failed to get object type: {}", e))?;
-                
-                let fields = connection.get_fields(class_id).await
-                    .map_err(|e| format!("Failed to get fields: {}", e))?;
-                
-                let field = fields.iter().find(|f| f.name == field_name)
-                    .ok_or_else(|| format!("Field '{}' not found", field_name))?;
-                
-                let values = connection.get_object_values(object_id, vec![field.field_id]).await
-                    .map_err(|e| format!("Failed to get field value: {}", e))?;
-                
-                current_value = values.into_iter().next()
-                    .ok_or_else(|| "Failed to retrieve field value".to_string())?;
-            } else {
-                return Err("Not an object".to_string());
+                pos += field_end;
             }
-            
-            pos += field_end;
         } else {
             return Err(format!("Unexpected character: {}", ch));
         }
     }
     
     Ok(current_value)
+}
+
+fn parse_method_args(args_str: &str) -> Result<Vec<jdwp_client::types::Value>, String> {
+    let args_str = args_str.trim();
+    if args_str.is_empty() {
+        return Ok(Vec::new());
+    }
+    
+    // For now, only support simple integer and string literals
+    let mut args = Vec::new();
+    for arg in args_str.split(',') {
+        let arg = arg.trim();
+        
+        // Try to parse as integer
+        if let Ok(val) = arg.parse::<i32>() {
+            args.push(jdwp_client::types::Value {
+                tag: 73, // 'I' = int
+                data: jdwp_client::types::ValueData::Int(val),
+            });
+        }
+        // Try to parse as string literal
+        else if arg.starts_with('"') && arg.ends_with('"') {
+            // For string arguments, we'd need to create a String object in the JVM
+            // This is complex, so for now just return an error
+            return Err("String arguments not yet supported".to_string());
+        }
+        else {
+            return Err(format!("Unsupported argument: {}", arg));
+        }
+    }
+    
+    Ok(args)
+}
+
+fn count_method_params(signature: &str) -> usize {
+    // Parse method signature like "(ILjava/lang/String;)V"
+    // Count parameters between ( and )
+    if let Some(start) = signature.find('(') {
+        if let Some(end) = signature.find(')') {
+            let params = &signature[start + 1..end];
+            if params.is_empty() {
+                return 0;
+            }
+            
+            let mut count = 0;
+            let mut i = 0;
+            let chars: Vec<char> = params.chars().collect();
+            
+            while i < chars.len() {
+                match chars[i] {
+                    'B' | 'C' | 'D' | 'F' | 'I' | 'J' | 'S' | 'Z' => {
+                        count += 1;
+                        i += 1;
+                    }
+                    'L' => {
+                        // Object type, skip until ;
+                        count += 1;
+                        while i < chars.len() && chars[i] != ';' {
+                            i += 1;
+                        }
+                        i += 1;
+                    }
+                    '[' => {
+                        // Array type
+                        count += 1;
+                        i += 1;
+                        // Skip the array element type
+                        if i < chars.len() && chars[i] == 'L' {
+                            while i < chars.len() && chars[i] != ';' {
+                                i += 1;
+                            }
+                        }
+                        i += 1;
+                    }
+                    _ => i += 1,
+                }
+            }
+            
+            return count;
+        }
+    }
+    0
 }
 
 async fn get_variable(
@@ -860,6 +980,23 @@ fn format_value_impl<'a>(
         
         // Check depth limit for non-String objects
         if depth > 2 {
+            // For objects at depth limit, show type name instead of just "object"
+            if let jdwp_client::types::ValueData::Object(object_id) = &value.data {
+                if *object_id != 0 {
+                    if let Ok(class_id) = connection.get_object_reference_type(*object_id).await {
+                        if let Ok(signature) = connection.get_signature(class_id).await {
+                            // Extract class name from signature (e.g., "Lcom/example/MyClass;" -> "MyClass")
+                            let class_name = signature
+                                .trim_start_matches('L')
+                                .trim_end_matches(';')
+                                .split('/')
+                                .last()
+                                .unwrap_or("object");
+                            return format!("{}@{:x}", class_name, object_id);
+                        }
+                    }
+                }
+            }
             return value.format();
         }
         
@@ -902,34 +1039,47 @@ fn format_value_impl<'a>(
             // Regular object (not string or array)
             if let jdwp_client::types::ValueData::Object(object_id) = &value.data {
                 if *object_id != 0 {
-                    // Get object's class
+                    // Get object's class to check if it's safe to inspect
                     match connection.get_object_reference_type(*object_id).await {
                         Ok(class_id) => {
-                            // Get class fields
-                            match connection.get_fields(class_id).await {
-                                Ok(fields) => {
-                                    if fields.is_empty() {
-                                        return format!("{{}}");
-                                    }
-                                    // Get field values (limit to first 5 fields)
-                                    let field_ids: Vec<_> = fields.iter().take(5).map(|f| f.field_id).collect();
-                                    match connection.get_object_values(*object_id, field_ids).await {
-                                        Ok(values) => {
-                                            let mut result = "{".to_string();
-                                            for (i, (field, val)) in fields.iter().zip(values.iter()).enumerate() {
-                                                if i > 0 {
-                                                    result.push_str(", ");
+                            // Get class signature to determine if it's a user class or JDK class
+                            match connection.get_signature(class_id).await {
+                                Ok(signature) => {
+                                    // Only inspect user-defined classes
+                                    // JDK classes shown as object IDs - use method calls to inspect them
+                                    let is_user_class = !signature.starts_with("Ljava/") 
+                                        && !signature.starts_with("Ljavax/")
+                                        && !signature.starts_with("Lsun/");
+                                    
+                                    if is_user_class {
+                                        // Safe to inspect user-defined classes
+                                        match connection.get_fields(class_id).await {
+                                            Ok(fields) => {
+                                                let instance_fields: Vec<_> = fields.iter()
+                                                    .filter(|f| (f.mod_bits & 0x0008) == 0)
+                                                    .take(5)
+                                                    .collect();
+                                                
+                                                if !instance_fields.is_empty() {
+                                                    let field_ids: Vec<_> = instance_fields.iter().map(|f| f.field_id).collect();
+                                                    if let Ok(values) = connection.get_object_values(*object_id, field_ids).await {
+                                                        let mut result = "{".to_string();
+                                                        for (i, (field, val)) in instance_fields.iter().zip(values.iter()).enumerate() {
+                                                            if i > 0 {
+                                                                result.push_str(", ");
+                                                            }
+                                                            result.push_str(&format!("{}: {}", field.name, format_value_impl(connection, val, 30, depth + 1).await));
+                                                        }
+                                                        result.push('}');
+                                                        return result;
+                                                    }
                                                 }
-                                                result.push_str(&format!("{}: {}", field.name, format_value_impl(connection, val, 30, depth + 1).await));
                                             }
-                                            if fields.len() > 5 {
-                                                result.push_str(&format!(", ... ({} more fields)", fields.len() - 5));
-                                            }
-                                            result.push('}');
-                                            return result;
+                                            _ => {}
                                         }
-                                        Err(_) => return format!("(object) @{:x}", object_id),
                                     }
+                                    // For JDK classes or if inspection failed, just show object ID
+                                    return format!("(object) @{:x}", object_id);
                                 }
                                 Err(_) => return format!("(object) @{:x}", object_id),
                             }

@@ -124,3 +124,5 @@ mod uuid {
         format!("{:x}{:x}", timestamp, counter)
     }
 }
+
+pub use uuid::v4 as uuid_v4;

@@ -144,6 +144,71 @@ fn read_value_by_tag(tag: u8, buf: &mut &[u8]) -> JdwpResult<ValueData> {
     }
 }
 
+impl JdwpConnection {
+    /// Invoke a method on an object (ObjectReference.InvokeMethod command)
+    pub async fn invoke_method(
+        &mut self,
+        object_id: ObjectId,
+        thread_id: crate::types::ThreadId,
+        class_id: ReferenceTypeId,
+        method_id: crate::types::MethodId,
+        arguments: Vec<Value>,
+    ) -> JdwpResult<Value> {
+        let id = self.next_id();
+        let mut packet = CommandPacket::new(
+            id,
+            command_sets::OBJECT_REFERENCE,
+            object_reference_commands::INVOKE_METHOD,
+        );
+
+        // Object ID
+        packet.data.put_u64(object_id);
+        // Thread ID
+        packet.data.put_u64(thread_id);
+        // Class ID
+        packet.data.put_u64(class_id);
+        // Method ID
+        packet.data.put_u64(method_id);
+        // Number of arguments
+        packet.data.put_i32(arguments.len() as i32);
+        
+        // Write each argument
+        for arg in &arguments {
+            packet.data.put_u8(arg.tag);
+            match &arg.data {
+                ValueData::Byte(v) => packet.data.put_i8(*v),
+                ValueData::Char(v) => packet.data.put_u16(*v),
+                ValueData::Double(v) => packet.data.put_f64(*v),
+                ValueData::Float(v) => packet.data.put_f32(*v),
+                ValueData::Int(v) => packet.data.put_i32(*v),
+                ValueData::Long(v) => packet.data.put_i64(*v),
+                ValueData::Short(v) => packet.data.put_i16(*v),
+                ValueData::Boolean(v) => packet.data.put_u8(if *v { 1 } else { 0 }),
+                ValueData::Object(v) => packet.data.put_u64(*v),
+                ValueData::Void => {}
+            }
+        }
+        
+        // Invoke options (0 = none)
+        packet.data.put_i32(0);
+
+        let reply = self.send_command(packet).await?;
+        reply.check_error()?;
+
+        let mut data = reply.data();
+        
+        // Read return value
+        let tag = read_u8(&mut data)?;
+        let value_data = read_value_by_tag(tag, &mut data)?;
+        
+        // Skip exception object (should be null if no exception)
+        let _exception_tag = read_u8(&mut data)?;
+        let _exception_id = read_u64(&mut data)?;
+
+        Ok(Value { tag, data: value_data })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

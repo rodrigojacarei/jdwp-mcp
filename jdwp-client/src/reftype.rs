@@ -110,4 +110,20 @@ impl JdwpConnection {
 
         Ok(fields)
     }
+
+    /// Get signature for a reference type (ReferenceType.Signature command)
+    pub async fn get_signature(&mut self, ref_type_id: ReferenceTypeId) -> JdwpResult<String> {
+        let id = self.next_id();
+        let mut packet = CommandPacket::new(id, command_sets::REFERENCE_TYPE, reference_type_commands::SIGNATURE);
+
+        packet.data.put_u64(ref_type_id);
+
+        let reply = self.send_command(packet).await?;
+        reply.check_error()?;
+
+        let mut data = reply.data();
+        let signature = read_string(&mut data)?;
+
+        Ok(signature)
+    }
 }
