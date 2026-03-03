@@ -146,6 +146,13 @@ pub mod event_kinds {
     pub const VM_DEATH: u8 = 99;
 }
 
+// ArrayReference commands (set 13)
+pub mod array_reference_commands {
+    pub const LENGTH: u8 = 1;
+    pub const GET_VALUES: u8 = 2;
+    pub const SET_VALUES: u8 = 3;
+}
+
 // Step sizes
 pub mod step_sizes {
     pub const MIN: i32 = 0;

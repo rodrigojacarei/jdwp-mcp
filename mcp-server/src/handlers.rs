@@ -361,19 +361,82 @@ impl RequestHandler {
         Ok("▶️  Execution resumed".to_string())
     }
 
-    async fn handle_step_over(&self, _args: serde_json::Value) -> Result<String, String> {
-        // TODO: Implement step over
-        Ok("Step over not yet implemented".to_string())
+    async fn handle_step_over(&self, args: serde_json::Value) -> Result<String, String> {
+        let session_guard = self.session_manager.get_current_session().await
+            .ok_or_else(|| "No active debug session".to_string())?;
+
+        let mut session = session_guard.lock().await;
+
+        let thread_id = args.get("thread_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+            .ok_or_else(|| "Missing or invalid 'thread_id' parameter".to_string())?;
+
+        // Set step request: LINE size, OVER depth
+        let request_id = session.connection.set_step(
+            thread_id,
+            jdwp_client::commands::step_sizes::LINE,
+            jdwp_client::commands::step_depths::OVER,
+        ).await
+            .map_err(|e| format!("Failed to set step: {}", e))?;
+
+        // Resume the thread
+        session.connection.resume_thread(thread_id).await
+            .map_err(|e| format!("Failed to resume thread: {}", e))?;
+
+        Ok(format!("⏭️  Stepping over (request ID: {})", request_id))
     }
 
-    async fn handle_step_into(&self, _args: serde_json::Value) -> Result<String, String> {
-        // TODO: Implement step into
-        Ok("Step into not yet implemented".to_string())
+    async fn handle_step_into(&self, args: serde_json::Value) -> Result<String, String> {
+        let session_guard = self.session_manager.get_current_session().await
+            .ok_or_else(|| "No active debug session".to_string())?;
+
+        let mut session = session_guard.lock().await;
+
+        let thread_id = args.get("thread_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+            .ok_or_else(|| "Missing or invalid 'thread_id' parameter".to_string())?;
+
+        // Set step request: LINE size, INTO depth
+        let request_id = session.connection.set_step(
+            thread_id,
+            jdwp_client::commands::step_sizes::LINE,
+            jdwp_client::commands::step_depths::INTO,
+        ).await
+            .map_err(|e| format!("Failed to set step: {}", e))?;
+
+        // Resume the thread
+        session.connection.resume_thread(thread_id).await
+            .map_err(|e| format!("Failed to resume thread: {}", e))?;
+
+        Ok(format!("⤵️  Stepping into (request ID: {})", request_id))
     }
 
-    async fn handle_step_out(&self, _args: serde_json::Value) -> Result<String, String> {
-        // TODO: Implement step out
-        Ok("Step out not yet implemented".to_string())
+    async fn handle_step_out(&self, args: serde_json::Value) -> Result<String, String> {
+        let session_guard = self.session_manager.get_current_session().await
+            .ok_or_else(|| "No active debug session".to_string())?;
+
+        let mut session = session_guard.lock().await;
+
+        let thread_id = args.get("thread_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+            .ok_or_else(|| "Missing or invalid 'thread_id' parameter".to_string())?;
+
+        // Set step request: LINE size, OUT depth
+        let request_id = session.connection.set_step(
+            thread_id,
+            jdwp_client::commands::step_sizes::LINE,
+            jdwp_client::commands::step_depths::OUT,
+        ).await
+            .map_err(|e| format!("Failed to set step: {}", e))?;
+
+        // Resume the thread
+        session.connection.resume_thread(thread_id).await
+            .map_err(|e| format!("Failed to resume thread: {}", e))?;
+
+        Ok(format!("⤴️  Stepping out (request ID: {})", request_id))
     }
 
     async fn handle_get_stack(&self, args: serde_json::Value) -> Result<String, String> {
@@ -484,9 +547,47 @@ impl RequestHandler {
         Ok(output)
     }
 
-    async fn handle_evaluate(&self, _args: serde_json::Value) -> Result<String, String> {
-        // TODO: Implement expression evaluation
-        Ok("Expression evaluation not yet implemented".to_string())
+    async fn handle_evaluate(&self, args: serde_json::Value) -> Result<String, String> {
+        let session_guard = self.session_manager.get_current_session().await
+            .ok_or_else(|| "No active debug session".to_string())?;
+
+        let mut session = session_guard.lock().await;
+
+        let thread_id = args.get("thread_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+            .ok_or_else(|| "Missing or invalid 'thread_id' parameter".to_string())?;
+
+        let frame_index = args.get("frame_index")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0) as usize;
+
+        let expression = args.get("expression")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing 'expression' parameter".to_string())?;
+
+        let max_result_length = args.get("max_result_length")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(500) as usize;
+
+        // Get frames
+        let frames = session.connection.get_frames(thread_id, 0, -1).await
+            .map_err(|e| format!("Failed to get frames: {}", e))?;
+
+        if frame_index >= frames.len() {
+            return Err(format!("Frame index {} out of range (0-{})", frame_index, frames.len() - 1));
+        }
+
+        let frame = &frames[frame_index];
+
+        // Evaluate the expression
+        match evaluate_expression(&mut session.connection, thread_id, frame.frame_id, &frame.location, expression).await {
+            Ok(value) => {
+                let result = format_value(&mut session.connection, &value, max_result_length).await;
+                Ok(format!("{} = {}", expression, result))
+            }
+            Err(e) => Err(e)
+        }
     }
 
     async fn handle_list_threads(&self, _args: serde_json::Value) -> Result<String, String> {
@@ -603,4 +704,243 @@ impl RequestHandler {
             Ok("No events received yet. Set a breakpoint and trigger it.".to_string())
         }
     }
+}
+
+async fn evaluate_expression(
+    connection: &mut jdwp_client::JdwpConnection,
+    thread_id: u64,
+    frame_id: u64,
+    location: &jdwp_client::types::Location,
+    expression: &str,
+) -> Result<jdwp_client::types::Value, String> {
+    // Parse and evaluate expression recursively
+    // Support: "var", "var[index]", "var.field", "var[index].field", etc.
+    
+    let expr = expression.trim();
+    
+    // Find the base variable name (everything before first [ or .)
+    let base_end = expr.find(|c| c == '[' || c == '.').unwrap_or(expr.len());
+    let base_var = &expr[..base_end];
+    
+    // Get the base variable value
+    let mut current_value = get_variable(connection, thread_id, frame_id, location, base_var).await?;
+    
+    // Process the rest of the expression
+    let mut pos = base_end;
+    while pos < expr.len() {
+        let ch = expr.chars().nth(pos).unwrap();
+        
+        if ch == '[' {
+            // Array indexing
+            let close_bracket = expr[pos..].find(']')
+                .ok_or_else(|| "Missing closing bracket".to_string())?;
+            let index_str = &expr[pos + 1..pos + close_bracket];
+            let index: i32 = index_str.parse()
+                .map_err(|_| format!("Invalid array index: {}", index_str))?;
+            
+            // Get array element
+            if let jdwp_client::types::ValueData::Object(array_id) = current_value.data {
+                if array_id == 0 {
+                    return Err("Array is null".to_string());
+                }
+                
+                let values = connection.get_array_values(array_id, index, 1).await
+                    .map_err(|e| format!("Failed to get array element: {}", e))?;
+                
+                current_value = values.into_iter().next()
+                    .ok_or_else(|| "Array index out of bounds".to_string())?;
+            } else {
+                return Err("Not an array".to_string());
+            }
+            
+            pos += close_bracket + 1;
+        } else if ch == '.' {
+            // Field access
+            pos += 1;
+            let field_end = expr[pos..].find(|c| c == '[' || c == '.').unwrap_or(expr.len() - pos);
+            let field_name = &expr[pos..pos + field_end];
+            
+            // Get field value
+            if let jdwp_client::types::ValueData::Object(object_id) = current_value.data {
+                if object_id == 0 {
+                    return Err("Object is null".to_string());
+                }
+                
+                let class_id = connection.get_object_reference_type(object_id).await
+                    .map_err(|e| format!("Failed to get object type: {}", e))?;
+                
+                let fields = connection.get_fields(class_id).await
+                    .map_err(|e| format!("Failed to get fields: {}", e))?;
+                
+                let field = fields.iter().find(|f| f.name == field_name)
+                    .ok_or_else(|| format!("Field '{}' not found", field_name))?;
+                
+                let values = connection.get_object_values(object_id, vec![field.field_id]).await
+                    .map_err(|e| format!("Failed to get field value: {}", e))?;
+                
+                current_value = values.into_iter().next()
+                    .ok_or_else(|| "Failed to retrieve field value".to_string())?;
+            } else {
+                return Err("Not an object".to_string());
+            }
+            
+            pos += field_end;
+        } else {
+            return Err(format!("Unexpected character: {}", ch));
+        }
+    }
+    
+    Ok(current_value)
+}
+
+async fn get_variable(
+    connection: &mut jdwp_client::JdwpConnection,
+    thread_id: u64,
+    frame_id: u64,
+    location: &jdwp_client::types::Location,
+    var_name: &str,
+) -> Result<jdwp_client::types::Value, String> {
+    // Get variable table
+    let var_table = connection.get_variable_table(location.class_id, location.method_id).await
+        .map_err(|e| format!("Failed to get variable table: {}", e))?;
+    
+    // Find active variables at current location
+    let active_vars: Vec<_> = var_table.iter()
+        .filter(|v| location.index >= v.code_index && location.index < v.code_index + v.length as u64)
+        .collect();
+    
+    // Look for variable by name
+    let var = active_vars.iter().find(|v| v.name == var_name)
+        .ok_or_else(|| format!("Variable '{}' not found in current scope", var_name))?;
+    
+    let slots = vec![jdwp_client::stackframe::VariableSlot {
+        slot: var.slot as i32,
+        sig_byte: var.signature.as_bytes()[0],
+    }];
+    
+    let values = connection.get_frame_values(thread_id, frame_id, slots).await
+        .map_err(|e| format!("Failed to get variable value: {}", e))?;
+    
+    values.into_iter().next()
+        .ok_or_else(|| format!("Failed to retrieve variable '{}'", var_name))
+}
+
+async fn format_value(connection: &mut jdwp_client::JdwpConnection, value: &jdwp_client::types::Value, max_length: usize) -> String {
+    format_value_impl(connection, value, max_length, 0).await
+}
+
+fn format_value_impl<'a>(
+    connection: &'a mut jdwp_client::JdwpConnection,
+    value: &'a jdwp_client::types::Value,
+    max_length: usize,
+    depth: usize,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = String> + 'a>> {
+    Box::pin(async move {
+        // Always expand Strings regardless of depth
+        if value.tag == 115 {
+            // String object
+            if let jdwp_client::types::ValueData::Object(object_id) = &value.data {
+                if *object_id != 0 {
+                    match connection.get_string_value(*object_id).await {
+                        Ok(string_val) => {
+                            let truncated = if string_val.len() > max_length {
+                                format!("{}...", &string_val[..max_length])
+                            } else {
+                                string_val
+                            };
+                            return format!("\"{}\"", truncated);
+                        }
+                        Err(_) => return value.format(),
+                    }
+                } else {
+                    return "null".to_string();
+                }
+            }
+        }
+        
+        // Check depth limit for non-String objects
+        if depth > 2 {
+            return value.format();
+        }
+        
+        if value.tag == 91 {
+            // Array object
+            if let jdwp_client::types::ValueData::Object(array_id) = &value.data {
+                if *array_id != 0 {
+                    match connection.get_array_length(*array_id).await {
+                        Ok(length) => {
+                            if length == 0 {
+                                return "[]".to_string();
+                            }
+                            // Get first few elements (max 10)
+                            let fetch_count = length.min(10);
+                            match connection.get_array_values(*array_id, 0, fetch_count).await {
+                                Ok(values) => {
+                                    let mut result = "[".to_string();
+                                    for (i, val) in values.iter().enumerate() {
+                                        if i > 0 {
+                                            result.push_str(", ");
+                                        }
+                                        result.push_str(&format_value_impl(connection, val, 50, depth + 1).await);
+                                    }
+                                    if length > fetch_count {
+                                        result.push_str(&format!(", ... ({} more)", length - fetch_count));
+                                    }
+                                    result.push(']');
+                                    return result;
+                                }
+                                Err(_) => return format!("(array) @{:x} [length={}]", array_id, length),
+                            }
+                        }
+                        Err(_) => return format!("(array) @{:x}", array_id),
+                    }
+                } else {
+                    return "null".to_string();
+                }
+            }
+        } else if value.tag == 76 {
+            // Regular object (not string or array)
+            if let jdwp_client::types::ValueData::Object(object_id) = &value.data {
+                if *object_id != 0 {
+                    // Get object's class
+                    match connection.get_object_reference_type(*object_id).await {
+                        Ok(class_id) => {
+                            // Get class fields
+                            match connection.get_fields(class_id).await {
+                                Ok(fields) => {
+                                    if fields.is_empty() {
+                                        return format!("{{}}");
+                                    }
+                                    // Get field values (limit to first 5 fields)
+                                    let field_ids: Vec<_> = fields.iter().take(5).map(|f| f.field_id).collect();
+                                    match connection.get_object_values(*object_id, field_ids).await {
+                                        Ok(values) => {
+                                            let mut result = "{".to_string();
+                                            for (i, (field, val)) in fields.iter().zip(values.iter()).enumerate() {
+                                                if i > 0 {
+                                                    result.push_str(", ");
+                                                }
+                                                result.push_str(&format!("{}: {}", field.name, format_value_impl(connection, val, 30, depth + 1).await));
+                                            }
+                                            if fields.len() > 5 {
+                                                result.push_str(&format!(", ... ({} more fields)", fields.len() - 5));
+                                            }
+                                            result.push('}');
+                                            return result;
+                                        }
+                                        Err(_) => return format!("(object) @{:x}", object_id),
+                                    }
+                                }
+                                Err(_) => return format!("(object) @{:x}", object_id),
+                            }
+                        }
+                        Err(_) => return format!("(object) @{:x}", object_id),
+                    }
+                } else {
+                    return "null".to_string();
+                }
+            }
+        }
+        value.format()
+    })
 }

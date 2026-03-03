@@ -108,4 +108,30 @@ impl JdwpConnection {
 
         Ok(())
     }
+
+    /// Resume a specific thread (ThreadReference.Resume)
+    pub async fn resume_thread(&mut self, thread_id: ThreadId) -> JdwpResult<()> {
+        let id = self.next_id();
+        let mut packet = CommandPacket::new(id, command_sets::THREAD_REFERENCE, crate::commands::thread_commands::RESUME);
+
+        packet.data.put_u64(thread_id);
+
+        let reply = self.send_command(packet).await?;
+        reply.check_error()?;
+
+        Ok(())
+    }
+
+    /// Suspend a specific thread (ThreadReference.Suspend)
+    pub async fn suspend_thread(&mut self, thread_id: ThreadId) -> JdwpResult<()> {
+        let id = self.next_id();
+        let mut packet = CommandPacket::new(id, command_sets::THREAD_REFERENCE, crate::commands::thread_commands::SUSPEND);
+
+        packet.data.put_u64(thread_id);
+
+        let reply = self.send_command(packet).await?;
+        reply.check_error()?;
+
+        Ok(())
+    }
 }

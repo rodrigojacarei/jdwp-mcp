@@ -77,4 +77,60 @@ impl JdwpConnection {
 
         Ok(())
     }
+
+    /// Set a single step request (EventRequest.Set command)
+    /// Returns the request ID for this step
+    pub async fn set_step(
+        &mut self,
+        thread_id: crate::types::ThreadId,
+        step_size: i32,
+        step_depth: i32,
+    ) -> JdwpResult<i32> {
+        let id = self.next_id();
+        let mut packet = CommandPacket::new(id, command_sets::EVENT_REQUEST, event_commands::SET);
+
+        // Event kind: SINGLE_STEP (1)
+        packet.data.put_u8(event_kinds::SINGLE_STEP);
+
+        // Suspend policy: EVENT_THREAD (1)
+        packet.data.put_u8(1);
+
+        // Number of modifiers (2 - thread and step)
+        packet.data.put_i32(2);
+
+        // Modifier 1: ThreadOnly (11)
+        packet.data.put_u8(11);
+        packet.data.put_u64(thread_id);
+
+        // Modifier 2: Step (10)
+        packet.data.put_u8(10);
+        packet.data.put_u64(thread_id);
+        packet.data.put_i32(step_size);
+        packet.data.put_i32(step_depth);
+
+        let reply = self.send_command(packet).await?;
+        reply.check_error()?;
+
+        let mut data = reply.data();
+        let request_id = read_i32(&mut data)?;
+
+        Ok(request_id)
+    }
+
+    /// Clear a step request by request ID
+    pub async fn clear_step(&mut self, request_id: i32) -> JdwpResult<()> {
+        let id = self.next_id();
+        let mut packet = CommandPacket::new(id, command_sets::EVENT_REQUEST, event_commands::CLEAR);
+
+        // Event kind: SINGLE_STEP
+        packet.data.put_u8(event_kinds::SINGLE_STEP);
+
+        // Request ID
+        packet.data.put_i32(request_id);
+
+        let reply = self.send_command(packet).await?;
+        reply.check_error()?;
+
+        Ok(())
+    }
 }
