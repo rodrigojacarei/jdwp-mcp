@@ -17,6 +17,7 @@ pub struct DebugSession {
     pub threads: HashMap<String, ThreadInfo>,
     pub last_event: Option<EventSet>,
     pub event_listener_task: Option<JoinHandle<()>>,
+    pub active_step_request: Option<i32>,
 }
 
 #[derive(Debug, Clone)]
@@ -60,6 +61,7 @@ impl SessionManager {
             threads: HashMap::new(),
             last_event: None,
             event_listener_task: None,
+            active_step_request: None,
         };
 
         let mut sessions = self.sessions.lock().await;

@@ -205,7 +205,7 @@ impl RequestHandler {
         let method_hint = args.get("method").and_then(|v| v.as_str());
 
         // Get current session
-        let session_guard = self.session_manager.get_current_session().await
+        let mut session_guard = self.session_manager.get_current_session().await
             .ok_or_else(|| "No active debug session. Use debug.attach first.".to_string())?;
 
         let mut session = session_guard.lock().await;
@@ -223,7 +223,77 @@ impl RequestHandler {
             .map_err(|e| format!("Failed to find class: {}", e))?;
 
         if classes.is_empty() {
-            return Err(format!("Class not found: {}", class_pattern));
+            // Class not loaded yet — use ClassPrepare event to wait for it
+            let cp_request_id = session.connection.set_class_prepare_request(
+                class_pattern,
+                jdwp_client::SuspendPolicy::All,
+            ).await.map_err(|e| format!("Failed to set ClassPrepare request: {}", e))?;
+
+            // Resume the JVM so the class can load
+            session.connection.resume_all().await
+                .map_err(|e| format!("Failed to resume: {}", e))?;
+
+            // Drop session lock while waiting for event
+            drop(session);
+            drop(session_guard);
+
+            // Wait for the ClassPrepare event (with timeout)
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut class_loaded = false;
+
+            loop {
+                if tokio::time::Instant::now() > deadline {
+                    break;
+                }
+
+                let sg = self.session_manager.get_current_session().await
+                    .ok_or_else(|| "Session lost while waiting for class load".to_string())?;
+                let mut s = sg.lock().await;
+
+                if let Some(event_set) = &s.last_event {
+                    for event in &event_set.events {
+                        if let jdwp_client::events::EventKind::ClassPrepare { signature: ref sig, .. } = event.details {
+                            let expected = format!("L{};", class_pattern.replace('.', "/"));
+                            if *sig == expected || *sig == signature {
+                                class_loaded = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if class_loaded {
+                    // Clean up the ClassPrepare request
+                    let _ = s.connection.clear_class_prepare_request(cp_request_id).await;
+                    break;
+                }
+
+                drop(s);
+                drop(sg);
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+
+            if !class_loaded {
+                // Clean up
+                let sg = self.session_manager.get_current_session().await
+                    .ok_or_else(|| "Session lost".to_string())?;
+                let mut s = sg.lock().await;
+                let _ = s.connection.clear_class_prepare_request(cp_request_id).await;
+                return Err(format!("Timeout waiting for class '{}' to load", class_pattern));
+            }
+
+            // Re-acquire session and retry finding the class
+            session_guard = self.session_manager.get_current_session().await
+                .ok_or_else(|| "Session lost".to_string())?;
+            session = session_guard.lock().await;
+        }
+
+        // Now the class should be loaded — find it
+        let classes = session.connection.classes_by_signature(&signature).await
+            .map_err(|e| format!("Failed to find class: {}", e))?;
+
+        if classes.is_empty() {
+            return Err(format!("Class not found after load: {}", class_pattern));
         }
 
         let class = &classes[0];
@@ -355,6 +425,11 @@ impl RequestHandler {
 
         let mut session = session_guard.lock().await;
 
+        // Clear any active step request so continue runs freely to next breakpoint
+        if let Some(step_id) = session.active_step_request.take() {
+            let _ = session.connection.clear_step(step_id).await;
+        }
+
         session.connection.resume_all().await
             .map_err(|e| format!("Failed to resume: {}", e))?;
 
@@ -372,7 +447,11 @@ impl RequestHandler {
             .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
             .ok_or_else(|| "Missing or invalid 'thread_id' parameter".to_string())?;
 
-        // Set step request: LINE size, OVER depth
+        // Clear any previous step request
+        if let Some(prev_id) = session.active_step_request.take() {
+            let _ = session.connection.clear_step(prev_id).await;
+        }
+
         let request_id = session.connection.set_step(
             thread_id,
             jdwp_client::commands::step_sizes::LINE,
@@ -380,7 +459,8 @@ impl RequestHandler {
         ).await
             .map_err(|e| format!("Failed to set step: {}", e))?;
 
-        // Resume the thread
+        session.active_step_request = Some(request_id);
+
         session.connection.resume_thread(thread_id).await
             .map_err(|e| format!("Failed to resume thread: {}", e))?;
 
@@ -398,7 +478,10 @@ impl RequestHandler {
             .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
             .ok_or_else(|| "Missing or invalid 'thread_id' parameter".to_string())?;
 
-        // Set step request: LINE size, INTO depth
+        if let Some(prev_id) = session.active_step_request.take() {
+            let _ = session.connection.clear_step(prev_id).await;
+        }
+
         let request_id = session.connection.set_step(
             thread_id,
             jdwp_client::commands::step_sizes::LINE,
@@ -406,7 +489,8 @@ impl RequestHandler {
         ).await
             .map_err(|e| format!("Failed to set step: {}", e))?;
 
-        // Resume the thread
+        session.active_step_request = Some(request_id);
+
         session.connection.resume_thread(thread_id).await
             .map_err(|e| format!("Failed to resume thread: {}", e))?;
 
@@ -424,7 +508,10 @@ impl RequestHandler {
             .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
             .ok_or_else(|| "Missing or invalid 'thread_id' parameter".to_string())?;
 
-        // Set step request: LINE size, OUT depth
+        if let Some(prev_id) = session.active_step_request.take() {
+            let _ = session.connection.clear_step(prev_id).await;
+        }
+
         let request_id = session.connection.set_step(
             thread_id,
             jdwp_client::commands::step_sizes::LINE,
@@ -432,7 +519,8 @@ impl RequestHandler {
         ).await
             .map_err(|e| format!("Failed to set step: {}", e))?;
 
-        // Resume the thread
+        session.active_step_request = Some(request_id);
+
         session.connection.resume_thread(thread_id).await
             .map_err(|e| format!("Failed to resume thread: {}", e))?;
 

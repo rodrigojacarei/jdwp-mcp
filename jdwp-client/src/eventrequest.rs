@@ -117,6 +117,48 @@ impl JdwpConnection {
         Ok(request_id)
     }
 
+    /// Request a ClassPrepare event for a class matching the given pattern.
+    /// Pattern uses JVM internal format (e.g. "com.example.MyClass").
+    /// Returns the request ID.
+    pub async fn set_class_prepare_request(
+        &mut self,
+        class_pattern: &str,
+        suspend_policy: SuspendPolicy,
+    ) -> JdwpResult<i32> {
+        let id = self.next_id();
+        let mut packet = CommandPacket::new(id, command_sets::EVENT_REQUEST, event_commands::SET);
+
+        // Event kind: CLASS_PREPARE (8)
+        packet.data.put_u8(event_kinds::CLASS_PREPARE);
+        packet.data.put_u8(suspend_policy as u8);
+
+        // 1 modifier: ClassMatch (5)
+        packet.data.put_i32(1);
+        packet.data.put_u8(5);
+        // UTF-8 string: length + bytes
+        let bytes = class_pattern.as_bytes();
+        packet.data.put_i32(bytes.len() as i32);
+        packet.data.put_slice(bytes);
+
+        let reply = self.send_command(packet).await?;
+        reply.check_error()?;
+
+        let mut data = reply.data();
+        let request_id = read_i32(&mut data)?;
+        Ok(request_id)
+    }
+
+    /// Clear a ClassPrepare event request by request ID
+    pub async fn clear_class_prepare_request(&mut self, request_id: i32) -> JdwpResult<()> {
+        let id = self.next_id();
+        let mut packet = CommandPacket::new(id, command_sets::EVENT_REQUEST, event_commands::CLEAR);
+        packet.data.put_u8(event_kinds::CLASS_PREPARE);
+        packet.data.put_i32(request_id);
+        let reply = self.send_command(packet).await?;
+        reply.check_error()?;
+        Ok(())
+    }
+
     /// Clear a step request by request ID
     pub async fn clear_step(&mut self, request_id: i32) -> JdwpResult<()> {
         let id = self.next_id();
